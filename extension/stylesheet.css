@@ -26,6 +26,11 @@
   background-color: #4a4e53;
 }
 .screen-touchpad-button:hover, .screen-touchpad-button:active { background-color: #5a5f65; }
+.screen-touchpad-button:checked { background-color: #54595f; color: #b9e4e6; }
+.screen-touchpad-settings { padding: 4px 9px; spacing: 3px; }
+.screen-touchpad-setting { spacing: 8px; }
+.screen-touchpad-settings .screen-touchpad-setting-label { min-width: 5.5em; }
+.screen-touchpad-setting-value { min-width: 3.4em; text-align: right; }
 .screen-touchpad-action {
   min-height: 36px;
   background-color: #54595f;

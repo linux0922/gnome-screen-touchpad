@@ -5,6 +5,9 @@ const SENSOR = 'net.hadess.SensorProxy';
 const SENSOR_PATH = '/net/hadess/SensorProxy';
 const DISPLAY = 'org.gnome.Mutter.DisplayConfig';
 const DISPLAY_PATH = '/org/gnome/Mutter/DisplayConfig';
+const EXTERNAL_ROTATION = 'io.github.linux0922.ScreenTouchpad.Rotation';
+const SETTLE_MS = 450;
+const NATIVE_HANDOFF_US = 900000;
 const ORIENTATIONS = new Map([['normal', 0], ['left-up', 1], ['bottom-up', 2], ['right-up', 3]]);
 
 function busCall(bus, destination, path, iface, method, parameters, cancellable) {
@@ -77,18 +80,58 @@ export class Rotation {
         this.cancel = new Gio.Cancellable();
         this.bus = null;
         this.pending = false;
-        this.desired = null;
-        this.managerId = manager.connect('notify::panel-orientation-managed', () => this.refresh());
+        this.target = null;
+        this.lastRequested = null;
+        this.timer = 0;
+        this.sensorRevision = 0;
+        this.eligible = false;
+        this.sensorReady = false;
+        // Wait for the initial name lookup before touching display configuration.
+        this.external = true;
+        this.externalWatch = Gio.bus_watch_name_on_connection(Gio.DBus.session, EXTERNAL_ROTATION,
+            Gio.BusNameWatcherFlags.NONE, () => this.setExternal(true), () => this.setExternal(false));
+        this.nativeSince = manager.get_panel_orientation_managed() ? GLib.get_monotonic_time() : 0;
+        this.managerId = manager.connect('notify::panel-orientation-managed', () => this.nativeChanged());
         this.orientationId = orientation.connect('notify::has-accelerometer', () => this.refresh());
-        this.settingsId = settings.connect('changed::orientation-lock', () => this.refresh());
+        this.settingsId = settings.connect('changed::orientation-lock', () => {
+            this.lastRequested = null;
+            this.refresh();
+        });
+        this.refresh();
+    }
+
+    setExternal(external) {
+        this.external = external;
+        this.lastRequested = null;
+        this.refresh();
+    }
+
+    nativeChanged() {
+        const now = GLib.get_monotonic_time();
+        if (this.manager.get_panel_orientation_managed()) {
+            this.nativeSince = now;
+        } else {
+            if (this.nativeSince && now - this.nativeSince >= NATIVE_HANDOFF_US)
+                this.lastRequested = null;
+            this.nativeSince = 0;
+        }
         this.refresh();
     }
 
     async refresh() {
-        if (!this.allowed())
+        const eligible = this.allowed();
+        if (eligible === this.eligible)
             return;
+        this.eligible = eligible;
+        this.sensorRevision++;
+        this.sensorReady = false;
+        if (!eligible) {
+            this.clearTimer();
+            return;
+        }
         if (this.bus) {
-            this.readOrientation();
+            if (!this.connecting)
+                this.readOrientation();
             return;
         }
         if (this.connecting)
@@ -106,8 +149,10 @@ export class Rotation {
                 SENSOR_PATH, SENSOR, Gio.DBusSignalFlags.NONE,
                 (_bus, _sender, _path, _interface, _signal, params) => {
                     const [, changed] = params.deepUnpack();
-                    if (changed.AccelerometerOrientation)
+                    if (changed.AccelerometerOrientation) {
+                        this.sensorRevision++;
                         this.offer(changed.AccelerometerOrientation.unpack());
+                    }
                 });
             await busCall(bus, SENSOR, SENSOR_PATH, SENSOR, 'ClaimAccelerometer', null, this.cancel);
             await this.readOrientation();
@@ -115,6 +160,7 @@ export class Rotation {
             if (!this.cancel.is_cancelled()) {
                 this.bus?.close(null, null);
                 this.bus = null;
+                this.eligible = false;
                 console.warn(`屏幕触控板无法读取方向传感器：${error.message}`);
             }
         } finally {
@@ -123,11 +169,13 @@ export class Rotation {
     }
 
     async readOrientation() {
+        const revision = this.sensorRevision;
         try {
             const [orientation] = await busCall(this.bus, SENSOR, SENSOR_PATH,
                 'org.freedesktop.DBus.Properties', 'Get',
                 new GLib.Variant('(ss)', [SENSOR, 'AccelerometerOrientation']), this.cancel);
-            this.offer(orientation.unpack());
+            if (revision === this.sensorRevision)
+                this.offer(orientation.unpack());
         } catch (error) {
             if (!this.cancel.is_cancelled())
                 console.warn(`屏幕触控板无法读取屏幕方向：${error.message}`);
@@ -135,27 +183,48 @@ export class Rotation {
     }
 
     offer(orientation) {
-        if (!ORIENTATIONS.has(orientation) || this.cancel.is_cancelled())
+        if (!this.allowed())
             return;
-        this.desired = ORIENTATIONS.get(orientation);
-        this.apply();
+        this.sensorReady = true;
+        const target = ORIENTATIONS.get(orientation) ?? null;
+        if (target !== this.target) {
+            this.target = target;
+            this.lastRequested = null;
+            this.clearTimer();
+        }
+        if (target !== null && target !== this.lastRequested && !this.timer) {
+            this.timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SETTLE_MS, () => {
+                this.timer = 0;
+                this.apply();
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+    }
+
+    clearTimer() {
+        if (this.timer) {
+            GLib.Source.remove(this.timer);
+            this.timer = 0;
+        }
     }
 
     allowed() {
-        return !this.cancel.is_cancelled() && !this.settings.get_boolean('orientation-lock') &&
+        return !this.external && !this.cancel.is_cancelled() && !this.settings.get_boolean('orientation-lock') &&
             rotationFallbackAvailable(this.manager, this.orientation);
     }
 
     async apply() {
-        if (this.pending || this.desired === null || !this.allowed())
+        if (!this.sensorReady || this.pending || this.timer || this.target === null ||
+            this.target === this.lastRequested || !this.allowed())
             return;
-        const transform = this.desired;
-        this.desired = null;
+        const transform = this.target;
+        // A display change (even a reversion) must not reapply the same reading.
+        this.lastRequested = transform;
         this.pending = true;
         try {
             const state = await busCall(Gio.DBus.session, DISPLAY, DISPLAY_PATH, DISPLAY,
                 'GetCurrentState', null, this.cancel);
-            if (!this.allowed() || this.desired !== null)
+            if (!this.sensorReady || !this.allowed() || this.timer || this.target !== transform)
                 return;
             const request = rotationRequest(state, transform);
             if (request) {
@@ -167,13 +236,14 @@ export class Rotation {
                 console.warn(`屏幕触控板无法自动旋转：${error.message}`);
         } finally {
             this.pending = false;
-            if (this.desired !== null && this.allowed())
-                this.apply();
+            this.apply();
         }
     }
 
     destroy() {
         this.cancel.cancel();
+        this.clearTimer();
+        Gio.bus_unwatch_name(this.externalWatch);
         this.manager.disconnect(this.managerId);
         this.orientation.disconnect(this.orientationId);
         this.settings.disconnect(this.settingsId);

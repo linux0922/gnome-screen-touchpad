@@ -25,9 +25,37 @@ const DOUBLE_TAP_RADIUS = 28;
 const GESTURE_TIMEOUT_MS = 5000;
 const POINTER_FOCUS_GRACE_MS = 120;
 const CURSOR_HANDOFF_MS = 120;
-const MIN_OPACITY = 50;
-const MAX_OPACITY = 100;
+const OPACITY = {key: 'opacity', label: '不透明度', min: 50, max: 100};
+const SENSITIVITY = {key: 'sensitivity', label: '鼠标灵敏度', min: 25, max: 200};
 const clamp = (value, min, max) => Math.max(min, Math.min(value, max));
+
+function settingSlider(settings, {key, label, min, max}) {
+    const row = new St.BoxLayout({style_class: 'screen-touchpad-setting', x_expand: true});
+    const slider = new Slider(0);
+    slider.x_expand = true;
+    slider.accessible_name = label;
+    const value = new St.Label({style_class: 'screen-touchpad-setting-value',
+        y_align: Clutter.ActorAlign.CENTER});
+    row.add_child(new St.Label({text: label, style_class: 'screen-touchpad-setting-label',
+        y_align: Clutter.ActorAlign.CENTER}));
+    row.add_child(slider);
+    row.add_child(value);
+
+    const sync = () => {
+        const percent = settings.get_int(key);
+        slider.value = (percent - min) / (max - min);
+        value.text = `${percent}%`;
+    };
+    const changedId = settings.connect(`changed::${key}`, sync);
+    row.connect('destroy', () => settings.disconnect(changedId));
+    sync();
+    slider.connect('notify::value', () => {
+        const percent = Math.round(min + slider.value * (max - min));
+        if (percent !== settings.get_int(key))
+            settings.set_int(key, percent);
+    });
+    return row;
+}
 
 class GestureCursor {
     constructor(seat) {
@@ -143,8 +171,9 @@ class GestureCursor {
 }
 
 class Pad {
-    constructor(onClose, geometry, rotationSettings) {
+    constructor(onClose, geometry, rotationSettings, preferences) {
         this.geometry = geometry;
+        this.preferences = preferences;
         this.contacts = new Map();
         this.gesture = null;
         this.edit = null;
@@ -166,6 +195,12 @@ class Pad {
         this.grip = new St.Label({text: '⠿  屏幕触控板', style_class: 'screen-touchpad-grip',
             x_expand: true, y_align: Clutter.ActorAlign.CENTER, reactive: true});
         header.add_child(this.grip);
+        this.settingsButton = new St.Button({
+            child: new St.Icon({icon_name: 'emblem-system-symbolic', icon_size: 16}),
+            style_class: 'screen-touchpad-button', accessible_name: '触控板设置',
+            toggle_mode: true, can_focus: true,
+        });
+        header.add_child(this.settingsButton);
         header.add_child(this.button('−', '缩小触控板', () => this.adjustSize(-1)));
         header.add_child(this.button('+', '放大触控板', () => this.adjustSize(1)));
         const close = this.button('×', '关闭屏幕触控板', onClose);
@@ -186,6 +221,19 @@ class Pad {
         this.surface.connect('touch-event', (_actor, event) => this.touch(event, false));
         this.strip.connect('touch-event', (_actor, event) => this.touch(event, true));
 
+        this.settingsPanel = new St.BoxLayout({
+            style_class: 'screen-touchpad-surface screen-touchpad-settings',
+            orientation: VERTICAL, y_expand: true, visible: false,
+        });
+        this.settingsPanel.add_child(settingSlider(preferences, OPACITY));
+        this.settingsPanel.add_child(settingSlider(preferences, SENSITIVITY));
+        this.actor.add_child(this.settingsPanel);
+        this.settingsButton.connect('notify::checked', () => {
+            this.cancelGesture();
+            surfaces.visible = !this.settingsButton.checked;
+            this.settingsPanel.visible = this.settingsButton.checked;
+        });
+
         const footer = this.row();
         for (const [label, button] of [['左键', 1], ['右键', 3]]) {
             const control = this.button(label, `点击${label}`, () => {
@@ -201,6 +249,17 @@ class Pad {
         footer.add_child(this.resize);
         this.actor.add_child(footer);
         this.bindGrip(this.resize, true);
+
+        const syncOpacity = () => {
+            this.actor.opacity = Math.round(preferences.get_int(OPACITY.key) * 255 / OPACITY.max);
+        };
+        const syncSensitivity = () => {
+            this.motionGain = 1.6 * preferences.get_int(SENSITIVITY.key) / 100;
+        };
+        this.opacityId = preferences.connect('changed::opacity', syncOpacity);
+        this.sensitivityId = preferences.connect('changed::sensitivity', syncSensitivity);
+        syncOpacity();
+        syncSensitivity();
 
         Main.layoutManager.addChrome(this.actor);
         this.reflow();
@@ -265,10 +324,6 @@ class Pad {
         this.geometry.width = this.actor.width + 48 * direction;
         this.geometry.height = this.actor.height + 26 * direction;
         this.reflow();
-    }
-
-    setOpacity(percent) {
-        this.actor.opacity = Math.round(percent * 255 / MAX_OPACITY);
     }
 
     queueMotion(dx = 0, dy = 0) {
@@ -544,7 +599,7 @@ class Pad {
                 this.scroll(gesture.strip ? 0 : -dx * gain, -dy * gain);
                 gesture.scrolling = true;
             } else if (!gesture.strip && count === 1) {
-                this.queueMotion(dx * 1.6, dy * 1.6);
+                this.queueMotion(dx * this.motionGain, dy * this.motionGain);
             }
         }
         // Refresh Mutter's pointer after physical touch, including the final lift.
@@ -576,6 +631,8 @@ class Pad {
     }
 
     destroy() {
+        this.preferences.disconnect(this.opacityId);
+        this.preferences.disconnect(this.sensitivityId);
         Main.layoutManager.disconnect(this.monitorId);
         Main.overview.disconnect(this.overviewId);
         Main.overview.disconnect(this.overviewHiddenId);
@@ -595,7 +652,7 @@ export default class ScreenTouchpadExtension extends Extension {
     enable() {
         this._geometry = {width: 440, height: 236};
         this._settings = new Gio.Settings({schema_id: 'org.gnome.settings-daemon.peripherals.touchscreen'});
-        this._appearance = this.getSettings();
+        this._preferences = this.getSettings();
         this._monitorManager = global.backend.get_monitor_manager();
         this._orientationManager = global.backend.get_orientation_manager();
         this._indicator = new QuickSettings.SystemIndicator();
@@ -607,7 +664,10 @@ export default class ScreenTouchpadExtension extends Extension {
             this._settings.get_boolean('orientation-lock'));
         lock.connect('toggled', (_item, checked) => this._settings.set_boolean('orientation-lock', checked));
         this._toggle.menu.addMenuItem(lock);
-        this._addOpacityControl();
+        const opacityItem = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
+        opacityItem.remove_style_class_name('popup-inactive-menu-item');
+        opacityItem.add_child(settingSlider(this._preferences, OPACITY));
+        this._toggle.menu.addMenuItem(opacityItem);
         this._toggle.connect('notify::checked', () => this._sync());
 
         this._rotationToggle = new QuickSettings.QuickToggle({
@@ -635,38 +695,10 @@ export default class ScreenTouchpadExtension extends Extension {
             rotationFallbackAvailable(this._monitorManager, this._orientationManager);
     }
 
-    _addOpacityControl() {
-        const row = new PopupMenu.PopupBaseMenuItem({reactive: false, can_focus: false});
-        row.remove_style_class_name('popup-inactive-menu-item');
-        row.add_child(new St.Label({text: '不透明度', y_align: Clutter.ActorAlign.CENTER}));
-        this._opacitySlider = new Slider(0);
-        this._opacitySlider.x_expand = true;
-        this._opacitySlider.accessible_name = '触控板不透明度';
-        this._opacityLabel = new St.Label({y_align: Clutter.ActorAlign.CENTER});
-        row.add_child(this._opacitySlider);
-        row.add_child(this._opacityLabel);
-
-        this._opacityId = this._appearance.connect('changed::opacity', () => this._syncOpacity());
-        this._syncOpacity();
-        this._opacitySlider.connect('notify::value', () => {
-            const percent = Math.round(MIN_OPACITY + this._opacitySlider.value * (MAX_OPACITY - MIN_OPACITY));
-            if (percent !== this._appearance.get_int('opacity'))
-                this._appearance.set_int('opacity', percent);
-        });
-        this._toggle.menu.addMenuItem(row);
-    }
-
-    _syncOpacity() {
-        const percent = this._appearance.get_int('opacity');
-        this._opacitySlider.value = (percent - MIN_OPACITY) / (MAX_OPACITY - MIN_OPACITY);
-        this._opacityLabel.text = `${percent}%`;
-        this._pad?.setOpacity(percent);
-    }
-
     _sync() {
         if (this._toggle.checked && !this._pad) {
-            this._pad = new Pad(() => { this._toggle.checked = false; }, this._geometry, this._settings);
-            this._pad.setOpacity(this._appearance.get_int('opacity'));
+            this._pad = new Pad(() => { this._toggle.checked = false; },
+                this._geometry, this._settings, this._preferences);
             Main.panel.statusArea.quickSettings.menu.close();
         } else if (!this._toggle.checked && this._pad) {
             this._pad.destroy();
@@ -679,7 +711,6 @@ export default class ScreenTouchpadExtension extends Extension {
         this._pad?.destroy();
         this._pad = null;
         this._settings.disconnect(this._lockId);
-        this._appearance.disconnect(this._opacityId);
         this._monitorManager.disconnect(this._rotationMonitorId);
         this._orientationManager.disconnect(this._rotationSensorId);
         Main.layoutManager.disconnect(this._rotationLayoutId);
@@ -687,6 +718,6 @@ export default class ScreenTouchpadExtension extends Extension {
         this._rotationToggle.destroy();
         this._indicator.destroy();
         this._toggle = this._indicator = this._settings = null;
-        this._appearance = this._opacitySlider = this._opacityLabel = null;
+        this._preferences = null;
     }
 }
