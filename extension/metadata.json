@@ -1,0 +1,8 @@
+{
+  "uuid": "screen-touchpad@codex.local",
+  "name": "屏幕触控板",
+  "description": "从快捷设置开启屏幕触控板，移动系统鼠标、点击和滚动。",
+  "shell-version": ["50"],
+  "settings-schema": "org.gnome.shell.extensions.screen-touchpad",
+  "version": 7
+}

@@ -1,0 +1,35 @@
+.screen-touchpad {
+  padding: 9px;
+  spacing: 7px;
+  border-radius: 18px;
+  border: 1px solid #4a4e53;
+  color: #ffffff;
+  background-color: #121416;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+.screen-touchpad-row { spacing: 6px; }
+.screen-touchpad-grip { padding: 5px 8px; font-weight: bold; color: #b0b8c0; }
+.screen-touchpad-surface, .screen-touchpad-strip {
+  border-radius: 11px;
+  border: 1px solid #4a4e53;
+  background-color: #33373b;
+  color: #ffffff;
+}
+.screen-touchpad-strip { background-color: #54595f; color: #b9e4e6; }
+.screen-touchpad-hint { text-align: center; padding: 5px; }
+.screen-touchpad-button {
+  padding: 4px 8px;
+  min-width: 28px;
+  min-height: 24px;
+  border-radius: 7px;
+  color: #ffd479;
+  background-color: #4a4e53;
+}
+.screen-touchpad-button:hover, .screen-touchpad-button:active { background-color: #5a5f65; }
+.screen-touchpad-action {
+  min-height: 36px;
+  background-color: #54595f;
+  color: #b9e4e6;
+}
+.screen-touchpad-close { background-color: #553a3a; color: #ffabab; }
+.screen-touchpad-close:hover, .screen-touchpad-close:active { background-color: #6d4646; }

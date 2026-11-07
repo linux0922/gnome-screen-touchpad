@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.screen-touchpad" path="/org/gnome/shell/extensions/screen-touchpad/">
+    <key name="opacity" type="i">
+      <range min="50" max="100"/>
+      <default>100</default>
+      <summary>Touchpad opacity in percent</summary>
+    </key>
+  </schema>
+</schemalist>
