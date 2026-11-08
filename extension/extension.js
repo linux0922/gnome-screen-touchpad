@@ -14,6 +14,9 @@ import {Slider} from 'resource:///org/gnome/shell/ui/slider.js';
 import {Rotation, rotationFallbackAvailable} from './rotation.js';
 
 const ICON = 'input-touchpad-symbolic';
+const KEYBOARD_UUID = 'erhai-osk@local';
+const RESTORE_SIZE = 44;
+const RESTORE_DRAG_THRESHOLD = 6;
 const VERTICAL = Clutter.Orientation.VERTICAL;
 const ET = Clutter.EventType;
 const PASS = Clutter.EVENT_PROPAGATE;
@@ -185,6 +188,9 @@ class Pad {
         this.focusSource = 0;
         this.dx = 0;
         this.dy = 0;
+        this.pendingInput = [];
+        this.minimized = false;
+        this.inOverview = false;
         this.seat = global.stage.context.get_backend().get_default_seat();
 
         this.actor = new St.BoxLayout({
@@ -201,8 +207,8 @@ class Pad {
             toggle_mode: true, can_focus: true,
         });
         header.add_child(this.settingsButton);
-        header.add_child(this.button('−', '缩小触控板', () => this.adjustSize(-1)));
-        header.add_child(this.button('+', '放大触控板', () => this.adjustSize(1)));
+        this.minimizeButton = this.button('▁', '最小化屏幕触控板', () => this.setMinimized(true));
+        header.add_child(this.minimizeButton);
         const close = this.button('×', '关闭屏幕触控板', onClose);
         close.add_style_class_name('screen-touchpad-close');
         header.add_child(close);
@@ -251,22 +257,33 @@ class Pad {
         this.bindGrip(this.resize, true);
 
         const syncOpacity = () => {
-            this.actor.opacity = Math.round(preferences.get_int(OPACITY.key) * 255 / OPACITY.max);
+            const alpha = Math.round(preferences.get_int(OPACITY.key) * 255 / OPACITY.max);
+            this.actor.opacity = this.restoreButton.opacity = alpha;
         };
         const syncSensitivity = () => {
             this.motionGain = 1.6 * preferences.get_int(SENSITIVITY.key) / 100;
         };
         this.opacityId = preferences.connect('changed::opacity', syncOpacity);
         this.sensitivityId = preferences.connect('changed::sensitivity', syncSensitivity);
-        syncOpacity();
         syncSensitivity();
 
-        Main.layoutManager.addChrome(this.actor);
-        this.reflow();
         this.cursor = new GestureCursor(this.seat);
-        this.device = this.seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
         this.rotation = new Rotation(global.backend.get_monitor_manager(),
             global.backend.get_orientation_manager(), rotationSettings);
+        this.restoreButton = new St.Button({
+            child: new St.Icon({icon_name: ICON, icon_size: 22}),
+            style_class: 'screen-touchpad-button screen-touchpad-restore',
+            accessible_name: '恢复屏幕触控板', can_focus: true,
+            width: RESTORE_SIZE, height: RESTORE_SIZE, visible: false,
+            offscreen_redirect: Clutter.OffscreenRedirect.AUTOMATIC_FOR_OPACITY,
+        });
+        const restore = () => this.setMinimized(false);
+        this.restoreButton.connect('clicked', restore);
+        this.bindGrip(this.restoreButton, false, restore);
+        syncOpacity();
+        Main.layoutManager.addChrome(this.actor);
+        Main.layoutManager.addChrome(this.restoreButton);
+        this.reflow();
 
         this.actor.connect('notify::mapped', () => {
             if (!this.actor.mapped)
@@ -278,11 +295,13 @@ class Pad {
             this.rotation.refresh();
         });
         this.overviewId = Main.overview.connect('showing', () => {
-            this.actor.hide();
+            this.inOverview = true;
+            this.syncVisibility();
         });
         this.overviewHiddenId = Main.overview.connect('hidden', () => {
+            this.inOverview = false;
             this.reflow();
-            this.actor.show();
+            this.syncVisibility();
         });
     }
 
@@ -318,12 +337,47 @@ class Pad {
             work.y + 6, work.y + work.height - height - 6));
         this.actor.set_size(width, height);
         this.actor.set_position(x, y);
+        this.restoreButton.set_position(
+            Math.round(clamp(this.geometry.restoreX ?? x + width - RESTORE_SIZE,
+                work.x + 6, work.x + work.width - RESTORE_SIZE - 6)),
+            Math.round(clamp(this.geometry.restoreY ?? y + height - RESTORE_SIZE,
+                work.y + 6, work.y + work.height - RESTORE_SIZE - 6)));
     }
 
-    adjustSize(direction) {
-        this.geometry.width = this.actor.width + 48 * direction;
-        this.geometry.height = this.actor.height + 26 * direction;
-        this.reflow();
+    setMinimized(minimized) {
+        this.minimized = minimized;
+        this.syncVisibility();
+    }
+
+    syncVisibility() {
+        this.actor.visible = !this.inOverview && !this.minimized;
+        this.restoreButton.visible = !this.inOverview && this.minimized;
+        if (!this.restoreButton.visible && this.edit?.actor === this.restoreButton)
+            this.clearEdit();
+    }
+
+    emitPointer(method, ...args) {
+        if (this.device) {
+            this.device[method](GLib.get_monotonic_time(), ...args);
+            return;
+        }
+        this.pendingInput.push([method, args]);
+        this.preparePointer();
+    }
+
+    async preparePointer() {
+        if (this.preparingPointer)
+            return;
+        this.preparingPointer = true;
+        await this.rotation.preparePointer();
+        this.preparingPointer = false;
+        if (!this.pendingInput.length)
+            return;
+        this.device = this.seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
+        this.rotation.pointerCreated();
+        const input = this.pendingInput.splice(0);
+        for (const [method, args] of input)
+            this.emitPointer(method, ...args);
     }
 
     queueMotion(dx = 0, dy = 0) {
@@ -345,7 +399,7 @@ class Pad {
             this.motionSource = 0;
         }
         this.keepPointerFocus();
-        this.device.notify_relative_motion(GLib.get_monotonic_time(), this.dx, this.dy);
+        this.emitPointer('notify_relative_motion', this.dx, this.dy);
         this.dx = this.dy = 0;
     }
 
@@ -364,7 +418,7 @@ class Pad {
     }
 
     sendButton(button, pressed) {
-        this.device.notify_button(GLib.get_monotonic_time(), button,
+        this.emitPointer('notify_button', button,
             pressed ? Clutter.ButtonState.PRESSED : Clutter.ButtonState.RELEASED);
     }
 
@@ -419,7 +473,7 @@ class Pad {
     }
 
     scroll(dx, dy, finish = false) {
-        this.device.notify_scroll_continuous(GLib.get_monotonic_time(), dx, dy,
+        this.emitPointer('notify_scroll_continuous', dx, dy,
             Clutter.ScrollSource.FINGER, finish ? SCROLL_END : Clutter.ScrollFinishFlags.NONE);
     }
 
@@ -482,34 +536,69 @@ class Pad {
         this.gesture = null;
         this.contacts.clear();
         this.takePendingTap();
-        this.edit = null;
+        this.clearEdit();
         if (this.motionSource) {
             GLib.Source.remove(this.motionSource);
             this.motionSource = 0;
         }
         this.dx = this.dy = 0;
+        this.pendingInput.length = 0;
         this.cursor.stop();
     }
 
-    bindGrip(actor, resize) {
+    clearEdit() {
+        const edit = this.edit;
+        this.edit = null;
+        if (edit?.timeout)
+            GLib.Source.remove(edit.timeout);
+        edit?.grab?.dismiss();
+    }
+
+    bindGrip(actor, resize, onTap = null) {
         const handle = (_actor, event) => {
             const kind = event.type();
+            if (kind !== ET.TOUCH_BEGIN && kind !== ET.TOUCH_UPDATE && kind !== ET.TOUCH_END &&
+                kind !== ET.TOUCH_CANCEL && kind !== ET.MOTION &&
+                kind !== ET.BUTTON_PRESS && kind !== ET.BUTTON_RELEASE)
+                return PASS;
+            if ((kind === ET.BUTTON_PRESS || kind === ET.BUTTON_RELEASE) && event.get_button() !== 1)
+                return PASS;
             const touch = event.get_event_sequence();
             const key = touch ? touch.get_slot() : 'mouse';
             const [x, y] = event.get_coords();
-            if (kind === ET.TOUCH_BEGIN || kind === ET.BUTTON_PRESS && event.get_button() === 1) {
+            if (kind === ET.TOUCH_BEGIN || kind === ET.BUTTON_PRESS) {
                 if (this.contacts.size || this.edit)
-                    return PASS;
+                    return onTap ? STOP : PASS;
                 this.takePendingTap();
-                this.edit = {actor, key, x, y, left: this.actor.x, top: this.actor.y,
-                    width: this.actor.width, height: this.actor.height};
+                const movedActor = onTap ? actor : this.actor;
+                this.edit = {actor, key, x, y, left: movedActor.x, top: movedActor.y,
+                    width: movedActor.width, height: movedActor.height, moved: false};
+                if (onTap && !touch) {
+                    this.edit.grab = global.stage.grab(actor);
+                    this.edit.timeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, GESTURE_TIMEOUT_MS, () => {
+                        this.edit.timeout = 0;
+                        this.clearEdit();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                }
                 return STOP;
             }
             if (this.edit?.actor !== actor || this.edit.key !== key)
                 return PASS;
-            if (kind === ET.TOUCH_UPDATE || kind === ET.MOTION) {
-                const dx = x - this.edit.x;
-                const dy = y - this.edit.y;
+            const dx = x - this.edit.x;
+            const dy = y - this.edit.y;
+            const updating = kind === ET.TOUCH_UPDATE || kind === ET.MOTION;
+            const released = kind === ET.TOUCH_END || kind === ET.BUTTON_RELEASE;
+            if (onTap && (updating || released)) {
+                if (this.edit.moved || Math.hypot(dx, dy) >= RESTORE_DRAG_THRESHOLD) {
+                    this.edit.moved = true;
+                    this.geometry.restoreX = this.edit.left + dx;
+                    this.geometry.restoreY = this.edit.top + dy;
+                    this.reflow();
+                    this.geometry.restoreX = actor.x;
+                    this.geometry.restoreY = actor.y;
+                }
+            } else if (updating) {
                 if (resize) {
                     this.geometry.width = this.edit.width + dx;
                     this.geometry.height = this.edit.height + dy;
@@ -518,11 +607,19 @@ class Pad {
                     this.geometry.y = this.edit.top + dy;
                 }
                 this.reflow();
-            } else {
-                this.edit = null;
+            }
+            if (!updating) {
+                const activate = onTap && released && !this.edit.moved;
+                this.clearEdit();
+                if (activate)
+                    onTap();
             }
             return STOP;
         };
+        if (onTap) {
+            actor.connect('captured-event', handle);
+            return;
+        }
         for (const signal of ['touch-event', 'button-press-event', 'button-release-event', 'motion-event'])
             actor.connect(signal, handle);
     }
@@ -536,7 +633,7 @@ class Pad {
         const kind = event.type();
         const [x, y] = event.get_coords();
         if (kind === ET.TOUCH_BEGIN) {
-            this.edit = null;
+            this.clearEdit();
             if (this.contacts.has(key))
                 this.cancelGesture();
             if (this.gesture && this.gesture.strip !== strip)
@@ -640,6 +737,7 @@ class Pad {
         this.cursor.destroy();
         this.rotation.destroy();
         this.actor.destroy();
+        this.restoreButton.destroy();
         this.device = null;
         GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
             System.gc();
@@ -688,6 +786,41 @@ export default class ScreenTouchpadExtension extends Extension {
         this._rotationLayoutId = Main.layoutManager.connect('monitors-changed', syncVisibility);
         this._indicator.quickSettingsItems.push(this._toggle, this._rotationToggle);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
+        this._keyboardStateId = Main.extensionManager.connect('extension-state-changed',
+            (_manager, extension) => {
+                if (extension.uuid === KEYBOARD_UUID)
+                    this._bindKeyboardOpacity(extension.stateObj);
+            });
+        this._sharedOpacityId = this._preferences.connect('changed::opacity', () => {
+            const percent = this._preferences.get_int(OPACITY.key);
+            if (this._keyboardPanel && this._keyboardPanel.opacity !== Math.round(percent * 255 / OPACITY.max))
+                this._keyboard._setOpacity(percent / OPACITY.max);
+        });
+        this._bindKeyboardOpacity(Main.extensionManager.lookup(KEYBOARD_UUID)?.stateObj);
+    }
+
+    _bindKeyboardOpacity(keyboard) {
+        const panel = typeof keyboard?._setOpacity === 'function' ? keyboard._box : null;
+        if (panel === this._keyboardPanel)
+            return;
+        if (this._keyboardPanel) {
+            this._keyboardPanel.disconnect(this._keyboardOpacityId);
+            this._keyboardPanel.disconnect(this._keyboardDestroyId);
+        }
+        this._keyboard = panel ? keyboard : null;
+        this._keyboardPanel = panel;
+        if (!panel)
+            return;
+        const sync = () => {
+            const percent = clamp(Math.round(panel.opacity * OPACITY.max / 255), OPACITY.min, OPACITY.max);
+            if (this._preferences.get_int(OPACITY.key) !== percent)
+                this._preferences.set_int(OPACITY.key, percent);
+        };
+        this._keyboardOpacityId = panel.connect('notify::opacity', sync);
+        this._keyboardDestroyId = panel.connect('destroy', () => {
+            this._keyboard = this._keyboardPanel = null;
+        });
+        sync();
     }
 
     _syncRotationVisibility() {
@@ -708,6 +841,9 @@ export default class ScreenTouchpadExtension extends Extension {
     }
 
     disable() {
+        Main.extensionManager.disconnect(this._keyboardStateId);
+        this._preferences.disconnect(this._sharedOpacityId);
+        this._bindKeyboardOpacity(null);
         this._pad?.destroy();
         this._pad = null;
         this._settings.disconnect(this._lockId);

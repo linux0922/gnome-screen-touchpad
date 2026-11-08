@@ -6,14 +6,15 @@ const SENSOR_PATH = '/net/hadess/SensorProxy';
 const DISPLAY = 'org.gnome.Mutter.DisplayConfig';
 const DISPLAY_PATH = '/org/gnome/Mutter/DisplayConfig';
 const EXTERNAL_ROTATION = 'io.github.linux0922.ScreenTouchpad.Rotation';
+const ACTIVE_POINTER = 'io.github.linux0922.ScreenTouchpad.Pointer';
 const SETTLE_MS = 450;
 const NATIVE_HANDOFF_US = 900000;
 const ORIENTATIONS = new Map([['normal', 0], ['left-up', 1], ['bottom-up', 2], ['right-up', 3]]);
 
-function busCall(bus, destination, path, iface, method, parameters, cancellable) {
+function busCall(bus, destination, path, iface, method, parameters, cancellable, timeout = 4000) {
     return new Promise((resolve, reject) => {
         bus.call(destination, path, iface, method, parameters, null,
-            Gio.DBusCallFlags.NONE, 4000, cancellable, (connection, result) => {
+            Gio.DBusCallFlags.NONE, timeout, cancellable, (connection, result) => {
                 try {
                     resolve(connection.call_finish(result).deepUnpack());
                 } catch (error) {
@@ -86,6 +87,11 @@ export class Rotation {
         this.sensorRevision = 0;
         this.eligible = false;
         this.sensorReady = false;
+        this.pointerOwner = 0;
+        this.handoff = null;
+        this.handoffTimer = 0;
+        this.restoring = false;
+        this.ignoreInitialReading = false;
         // Wait for the initial name lookup before touching display configuration.
         this.external = true;
         this.externalWatch = Gio.bus_watch_name_on_connection(Gio.DBus.session, EXTERNAL_ROTATION,
@@ -95,9 +101,77 @@ export class Rotation {
         this.orientationId = orientation.connect('notify::has-accelerometer', () => this.refresh());
         this.settingsId = settings.connect('changed::orientation-lock', () => {
             this.lastRequested = null;
+            this.ignoreInitialReading = false;
+            this.initialReading = undefined;
             this.refresh();
         });
+    }
+
+    async preparePointer() {
+        this.handoff = null;
+        this.ignoreInitialReading = true;
+        if (!this.manager.get_panel_orientation_managed())
+            return;
+        try {
+            const [, , logical] = await busCall(Gio.DBus.session, DISPLAY, DISPLAY_PATH, DISPLAY,
+                'GetCurrentState', null, this.cancel, 350);
+            if (logical.length === 1 && logical[0][5].length === 1)
+                this.handoff = {transform: logical[0][3], connector: logical[0][5][0][0]};
+        } catch (error) {
+            if (!this.cancel.is_cancelled())
+                console.warn(`屏幕触控板无法读取当前显示方向：${error.message}`);
+        }
+    }
+
+    pointerCreated() {
+        this.pointerOwner = Gio.bus_own_name_on_connection(Gio.DBus.session, ACTIVE_POINTER,
+            Gio.BusNameOwnerFlags.DO_NOT_QUEUE, null, null);
+        if (this.handoff && this.manager.get_panel_orientation_managed()) {
+            this.handoffTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 750, () => {
+                this.handoffTimer = 0;
+                this.handoff = null;
+                this.refresh();
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+        this.restoreHandoff();
         this.refresh();
+    }
+
+    async restoreHandoff() {
+        if (!this.pointerOwner || !this.handoff || this.manager.get_panel_orientation_managed())
+            return;
+        const {transform, connector} = this.handoff;
+        this.clearHandoffTimer();
+        this.handoff = null;
+        if (!rotationFallbackAvailable(this.manager, this.orientation))
+            return;
+        this.restoring = true;
+        try {
+            const state = await busCall(Gio.DBus.session, DISPLAY, DISPLAY_PATH, DISPLAY,
+                'GetCurrentState', null, this.cancel);
+            if (this.cancel.is_cancelled() || !rotationFallbackAvailable(this.manager, this.orientation) ||
+                state[2][0]?.[5][0]?.[0] !== connector)
+                return;
+            const request = rotationRequest(state, transform);
+            if (request) {
+                await busCall(Gio.DBus.session, DISPLAY, DISPLAY_PATH, DISPLAY,
+                    'ApplyMonitorsConfig', request, this.cancel);
+            }
+        } catch (error) {
+            if (!this.cancel.is_cancelled())
+                console.warn(`屏幕触控板无法保留当前显示方向：${error.message}`);
+        } finally {
+            this.restoring = false;
+            this.refresh();
+        }
+    }
+
+    clearHandoffTimer() {
+        if (this.handoffTimer) {
+            GLib.Source.remove(this.handoffTimer);
+            this.handoffTimer = 0;
+        }
     }
 
     setExternal(external) {
@@ -115,6 +189,7 @@ export class Rotation {
                 this.lastRequested = null;
             this.nativeSince = 0;
         }
+        this.restoreHandoff();
         this.refresh();
     }
 
@@ -185,8 +260,17 @@ export class Rotation {
     offer(orientation) {
         if (!this.allowed())
             return;
-        this.sensorReady = true;
         const target = ORIENTATIONS.get(orientation) ?? null;
+        if (this.ignoreInitialReading && target !== null) {
+            this.ignoreInitialReading = false;
+            this.initialReading = target;
+        }
+        if (this.initialReading !== undefined) {
+            if (target === null || target === this.initialReading)
+                return;
+            this.initialReading = undefined;
+        }
+        this.sensorReady = true;
         if (target !== this.target) {
             this.target = target;
             this.lastRequested = null;
@@ -209,7 +293,8 @@ export class Rotation {
     }
 
     allowed() {
-        return !this.external && !this.cancel.is_cancelled() && !this.settings.get_boolean('orientation-lock') &&
+        return this.pointerOwner !== 0 && !this.handoff && !this.restoring && !this.external &&
+            !this.cancel.is_cancelled() && !this.settings.get_boolean('orientation-lock') &&
             rotationFallbackAvailable(this.manager, this.orientation);
     }
 
@@ -243,7 +328,10 @@ export class Rotation {
     destroy() {
         this.cancel.cancel();
         this.clearTimer();
+        this.clearHandoffTimer();
         Gio.bus_unwatch_name(this.externalWatch);
+        if (this.pointerOwner)
+            Gio.bus_unown_name(this.pointerOwner);
         this.manager.disconnect(this.managerId);
         this.orientation.disconnect(this.orientationId);
         this.settings.disconnect(this.settingsId);

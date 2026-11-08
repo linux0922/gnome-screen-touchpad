@@ -38,3 +38,10 @@
 }
 .screen-touchpad-close { background-color: #553a3a; color: #ffabab; }
 .screen-touchpad-close:hover, .screen-touchpad-close:active { background-color: #6d4646; }
+.screen-touchpad-restore {
+  padding: 0;
+  color: #b9e4e6;
+  background-color: #33373b;
+  border: 1px solid #4a4e53;
+  border-radius: 12px;
+}
