@@ -2,22 +2,18 @@
 
 把触摸屏的一小块区域变成悬浮触控板。手指在触控板上滑动时，系统鼠标指针会跟着移动，方便在 Ubuntu 平板和二合一电脑上操作小按钮、拖动窗口和选中文本。触控板外的区域仍可直接触摸。
 
-## 兼容性
-
-- 在 **Ubuntu 26.04.1 LTS、GNOME Shell 50.1、Wayland** 环境验证过。扩展声明支持 GNOME Shell 50，使用前可运行 `gnome-shell --version` 和 `echo "$XDG_SESSION_TYPE"` 检查。
-- 需要触摸屏。安装到当前用户，无需管理员权限。
-- 自动旋转补偿适用于带有可用加速度计、且只启用一块内置屏幕的设备。GNOME 自己能够控制旋转时，由 GNOME 接管。
-
 ## 安装
 
-1. [下载扩展安装包](downloads/screen-touchpad%40codex.local.shell-extension.zip?raw=1)，在下载目录打开终端。
-2. 运行以下命令。
+适用于带触摸屏的 **GNOME Shell 50 / Wayland**。已在 Ubuntu 26.04.1 LTS 验证，安装到当前用户，无需管理员权限。
+
+1. 从 [GitHub Releases 下载最新版安装包](https://github.com/linux0922/gnome-screen-touchpad/releases/latest/download/screen-touchpad%40codex.local.shell-extension.zip)。
+2. 在安装包所在目录打开终端，执行以下命令。首次安装和升级使用同一条命令。
 
    ```sh
    gnome-extensions install --force ./screen-touchpad@codex.local.shell-extension.zip
    ```
 
-3. 注销并重新登录，再启用扩展。
+3. 注销并重新登录。首次安装时启用扩展。
 
    ```sh
    gnome-extensions enable screen-touchpad@codex.local
@@ -25,7 +21,7 @@
 
 4. 点击桌面右上角的系统状态区域，在「快捷设置」里开启「屏幕触控板」。
 
-升级时用新版安装包重新执行安装命令，然后注销并重新登录。
+各版本的安装包和更新记录见 [Releases](https://github.com/linux0922/gnome-screen-touchpad/releases)。
 
 ## 操作方法
 
@@ -48,15 +44,19 @@
 
 触控板和最小化图标使用相同的不透明度。如果已启用兼容的 PAD-OSK 屏幕键盘（`erhai-osk@local`），两边也会同步，首次同步采用键盘当前的设置。
 
-打开触控板面板时会保留当前屏幕方向。首次使用触控区域时才启用虚拟鼠标；接管自动旋转时会保留已有方向，并等待新的稳定传感器读数。如果 GNOME 隐藏了自动旋转开关，且设备满足上面的传感器和屏幕条件，扩展会在快捷设置中补上「自动旋转」开关。这个开关与子菜单中的「锁定屏幕旋转」共用系统设置。
+打开触控板面板时会保留当前屏幕方向。首次使用触控区域时才启用虚拟鼠标，接管自动旋转时会等待新的稳定传感器读数。
 
-## 从源码打包
+自动旋转补偿适用于有可用加速度计且只启用一块内置屏幕的设备。如果 GNOME 隐藏了自动旋转开关，扩展会在快捷设置中补上「自动旋转」开关。该开关与子菜单中的「锁定屏幕旋转」共用系统设置。
 
-在仓库根目录执行以下命令，安装包会生成到 `downloads/`。
+## 从源码构建
+
+扩展源码在 `extension/`，构建产物生成到 `dist/`。在仓库根目录运行以下命令，需要 `make` 和 `gnome-extensions`。
 
 ```sh
-gnome-extensions pack --force --extra-source=rotation.js --out-dir=downloads extension
+make pack
 ```
+
+用 `make install` 可以构建并安装到当前用户，之后按上面的步骤重新登录并启用扩展。
 
 ## 停用或卸载
 
